@@ -13,9 +13,7 @@ app = Flask(__name__)
 # ==========================================
 
 APIMIRA_API_KEY = os.getenv("APIMIRA_API_KEY")
-
 API_URL = "https://apimira.com/v1/chat/completions"
-
 MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
 
 
@@ -90,8 +88,93 @@ SYSTEM_PROMPT = """
 # ==========================================
 
 history = {}
-
 MAX_HISTORY = 20
+
+
+# ==========================================
+# ОБЩАЯ ФУНКЦИЯ ОБЩЕНИЯ С APIMIRA
+# ==========================================
+
+def get_ai_reply(user_id, text, timeout=90):
+
+    if not APIMIRA_API_KEY:
+        return "У меня нет API-ключа Apimira. Проверь .env, бля."
+
+    if user_id not in history:
+        history[user_id] = []
+
+    history[user_id].append({
+        "role": "user",
+        "content": text
+    })
+
+    history[user_id] = history[user_id][-MAX_HISTORY:]
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+        },
+        *history[user_id]
+    ]
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": 500,
+        "temperature": 0.9
+    }
+
+    headers = {
+        "Authorization": f"Bearer {APIMIRA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            API_URL,
+            json=payload,
+            headers=headers,
+            timeout=timeout
+        )
+
+        response.raise_for_status()
+
+        result = response.json()
+        reply = result["choices"][0]["message"]["content"]
+
+        if not reply:
+            reply = "Я получила пустой ответ. Какого хрена."
+
+        history[user_id].append({
+            "role": "assistant",
+            "content": reply
+        })
+
+        history[user_id] = history[user_id][-MAX_HISTORY:]
+
+        return reply
+
+    except requests.exceptions.Timeout:
+        return "Модель слишком долго думает. Я уже сама заебалась ждать."
+
+    except requests.exceptions.HTTPError as e:
+        print("Apimira HTTP error:", e)
+        print("API response:", response.text)
+
+        return f"Apimira вернула HTTP {response.status_code}. Проверь ключ, баланс и модель."
+
+    except (KeyError, IndexError, ValueError) as e:
+        print("Response parsing error:", e)
+        return "Мне пришёл какой-то кривой ответ от API."
+
+    except requests.exceptions.RequestException as e:
+        print("Apimira connection error:", e)
+        return "Не могу подключиться к Apimira. Интернет опять устроил цирк."
+
+    except Exception as e:
+        print("Unexpected error:", e)
+        return "Что-то пошло не так. Попробуй ещё раз."
 
 
 # ==========================================
@@ -104,7 +187,7 @@ def health():
 
 
 # ==========================================
-# ЧАТ С МАТНОЙ
+# ОБЫЧНЫЙ ЧАТ
 # ==========================================
 
 @app.route("/chat", methods=["POST"])
@@ -120,117 +203,60 @@ def chat():
             "reply": "Ты мне пустоту прислал, гений."
         }), 400
 
-    if not APIMIRA_API_KEY:
-        return jsonify({
-            "reply": "У меня нет API-ключа Apimira. Проверь .env, бля."
-        }), 500
+    reply = get_ai_reply(user_id, text, timeout=90)
 
-    # Создаём историю пользователя
-    if user_id not in history:
-        history[user_id] = []
-
-    # Добавляем сообщение пользователя
-    history[user_id].append({
-        "role": "user",
-        "content": text
+    return jsonify({
+        "reply": reply
     })
 
-    # Оставляем последние сообщения
-    history[user_id] = history[user_id][-MAX_HISTORY:]
 
-    # Формируем контекст
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        },
-        *history[user_id]
-    ]
+# ==========================================
+# ИНТЕГРАЦИЯ С ЯНДЕКС АЛИСОЙ
+# ==========================================
 
-    # ==========================================
-    # ЗАПРОС К APIMIRA
-    # ==========================================
+@app.route("/alice", methods=["POST"])
+def alice():
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": 500,
-        "temperature": 0.9
-    }
+    data = request.get_json(silent=True) or {}
 
-    headers = {
-        "Authorization": f"Bearer {APIMIRA_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    alice_request = data.get("request", {})
+    session = data.get("session", {})
 
-    try:
+    # Определяем пользователя Алисы
+    user_id = (
+        session.get("user", {}).get("user_id")
+        or session.get("application", {}).get("application_id")
+        or session.get("session_id")
+        or "alice"
+    )
 
-        response = requests.post(
-            API_URL,
-            json=payload,
-            headers=headers,
-            timeout=90
+    # Получаем текст пользователя
+    text = (
+        alice_request.get("command")
+        or alice_request.get("original_utterance")
+        or ""
+    ).strip()
+
+    # Если пользователь просто запустил навык
+    if not text:
+        answer = "О, привет! Я Матная. Ну что, о чём поболтаем?"
+
+    else:
+        # Алиса ждёт ответ быстро, поэтому ограничиваем время запроса
+        answer = get_ai_reply(
+            user_id=str(user_id),
+            text=text,
+            timeout=3.2
         )
 
-        response.raise_for_status()
-
-        result = response.json()
-
-        reply = result["choices"][0]["message"]["content"]
-
-        if not reply:
-            reply = "Я получила пустой ответ. Какого хрена."
-
-        # Сохраняем ответ в историю
-        history[user_id].append({
-            "role": "assistant",
-            "content": reply
-        })
-
-        history[user_id] = history[user_id][-MAX_HISTORY:]
-
-        return jsonify({
-            "reply": reply
-        })
-
-    except requests.exceptions.Timeout:
-
-        return jsonify({
-            "reply": "Модель слишком долго думает. Я уже сама заебалась ждать."
-        }), 504
-
-    except requests.exceptions.HTTPError as e:
-
-        print("Apimira HTTP error:", e)
-        print("API response:", response.text)
-
-        return jsonify({
-            "reply": f"Apimira вернула HTTP {response.status_code}. Проверь ключ, баланс и модель."
-        }), 502
-
-    except (KeyError, IndexError, ValueError) as e:
-
-        print("Response parsing error:", e)
-
-        return jsonify({
-            "reply": "Мне пришёл какой-то кривой ответ от API."
-        }), 502
-
-    except requests.exceptions.RequestException as e:
-
-        print("Apimira connection error:", e)
-
-        return jsonify({
-            "reply": "Не могу подключиться к Apimira. Интернет опять устроил цирк."
-        }), 502
-
-    except Exception as e:
-
-        print("Unexpected error:", e)
-
-        return jsonify({
-            "reply": "Что-то пошло не так. Попробуй ещё раз."
-        }), 500
+    # Формируем ответ в формате Яндекс Алисы
+    return jsonify({
+        "response": {
+            "text": str(answer)[:1024],
+            "end_session": False
+        },
+        "version": "1.0"
+    })
 
 
 # ==========================================
@@ -238,6 +264,7 @@ def chat():
 # ==========================================
 
 if __name__ == "__main__":
+
     app.run(
         host="127.0.0.1",
         port=5000,
