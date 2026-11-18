@@ -1,7 +1,7 @@
 import os
 import threading
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import requests
 from flask import Flask, request, jsonify
@@ -16,13 +16,21 @@ app = Flask(__name__)
 # ==========================================
 
 APIMIRA_API_KEY = os.getenv("APIMIRA_API_KEY")
+
 API_URL = os.getenv(
     "APIMIRA_API_URL",
     "https://apimira.com/v1/chat/completions"
 )
-MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.6-terra")
+
+MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "openai/gpt-5.6-terra"
+)
 
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "60"))
+
+# Сколько Алиса ждёт модель непосредственно
+ALICE_WAIT_TIMEOUT = 3.0
 
 MAX_HISTORY = 20
 MAX_QUEUED_MESSAGES = 5
@@ -33,10 +41,7 @@ state_lock = threading.RLock()
 
 history = defaultdict(list)
 
-# Состояние каждого пользователя:
-# future — выполняющийся запрос
-# queue — очередь сообщений
-
+# Состояние пользователей
 users = {}
 
 
@@ -107,7 +112,7 @@ SYSTEM_PROMPT = """
 
 
 # ==========================================
-# ИСТОРИЯ ДИАЛОГА
+# ИСТОРИЯ
 # ==========================================
 
 def add_to_history(user_id, role, content):
@@ -123,16 +128,14 @@ def add_to_history(user_id, role, content):
 
 
 # ==========================================
-# ЗАПРОС К APIMIRA
+# APIMIRA
 # ==========================================
 
 def get_ai_reply(user_id, text):
 
     if not APIMIRA_API_KEY:
-        return (
-            "У меня нет API-ключа ApiMira. "
-            "Проверь APIMIRA_API_KEY в Render."
-        )
+
+        return "Нет API-ключа ApiMira. Проверь настройки Render."
 
     add_to_history(user_id, "user", text)
 
@@ -174,11 +177,13 @@ def get_ai_reply(user_id, text):
 
         if not isinstance(reply, str) or not reply.strip():
 
-            reply = "Я получила пустой ответ. Какого хрена."
+            reply = "Что-то модель мне пустоту прислала."
 
         reply = reply.strip()
 
         add_to_history(user_id, "assistant", reply)
+
+        print(f"AI response OK: user={user_id}")
 
         return reply
 
@@ -197,15 +202,15 @@ def get_ai_reply(user_id, text):
         )
 
         reply = (
-            f"ApiMira вернула HTTP {response.status_code}. "
-            "Проверь API-ключ, модель и баланс."
+            f"Ошибка ApiMira HTTP {response.status_code}. "
+            "Проверь API-ключ и баланс."
         )
 
     except (KeyError, IndexError, TypeError, ValueError) as exc:
 
         print("ApiMira parsing error:", repr(exc))
 
-        reply = "Мне пришёл непонятный ответ от ApiMira."
+        reply = "Получила непонятный ответ от ApiMira."
 
     except requests.exceptions.RequestException as exc:
 
@@ -243,7 +248,7 @@ def get_user_state(user_id):
 
 
 # ==========================================
-# ЗАПУСК СЛЕДУЮЩЕГО ЗАПРОСА
+# ЗАПУСК СЛЕДУЮЩЕГО ВОПРОСА
 # ==========================================
 
 def start_next_locked(user_id):
@@ -258,43 +263,54 @@ def start_next_locked(user_id):
 
     text = state["queue"].popleft()
 
-    future = executor.submit(
+    state["future"] = executor.submit(
         get_ai_reply,
         user_id,
         text
     )
 
-    state["future"] = future
-
     print(
-        f"Background task started: "
-        f"user={user_id}, remaining={len(state['queue'])}"
+        f"Started background request: {user_id}"
     )
 
 
 # ==========================================
-# ДОБАВЛЕНИЕ СООБЩЕНИЯ В ОЧЕРЕДЬ
+# ПРОВЕРКА ЗАВЕРШЕНИЯ ЗАДАЧИ
 # ==========================================
 
-def enqueue_message(user_id, text):
+def finish_task_locked(user_id):
 
-    with state_lock:
+    state = get_user_state(user_id)
 
-        state = get_user_state(user_id)
+    future = state["future"]
 
-        if len(state["queue"]) >= MAX_QUEUED_MESSAGES:
+    if future is None:
+        return None, False
 
-            return False
+    if not future.done():
+        return None, False
 
-        state["queue"].append(text[:2000])
+    try:
 
-        start_next_locked(user_id)
+        answer = future.result()
 
-        return True
+    except Exception as exc:
+
+        print("Future error:", repr(exc))
+
+        answer = "У меня произошла ошибка при обработке вопроса."
+
+    state["future"] = None
+
+    # Запускаем следующий вопрос из очереди.
+
+    start_next_locked(user_id)
+
+    return answer, True
 
 
 # ==========================================
-# ПРОВЕРКА ГОТОВНОСТИ
+# ПРОВЕРКА ФРАЗЫ О ГОТОВНОСТИ
 # ==========================================
 
 def is_status_question(text):
@@ -308,78 +324,14 @@ def is_status_question(text):
         "ну что там",
         "проверить ответ",
         "есть ответ",
-        "матная ответь",
         "получилось",
         "ты уже ответила",
-        "готово",
     )
 
     return any(
         phrase in normalized
         for phrase in phrases
     )
-
-
-def collect_finished_answer(user_id):
-
-    with state_lock:
-
-        state = get_user_state(user_id)
-
-        future = state["future"]
-
-        if future is None:
-
-            if state["queue"]:
-
-                start_next_locked(user_id)
-
-                return None
-
-            return None
-
-        if not future.done():
-
-            return None
-
-        try:
-
-            answer = future.result()
-
-        except Exception as exc:
-
-            print("Background task error:", repr(exc))
-
-            answer = "У меня тут фоновая задачка споткнулась."
-
-        state["future"] = None
-
-        # Запускаем следующее сообщение,
-        # если пользователь успел задать ещё вопросы.
-
-        start_next_locked(user_id)
-
-        return answer
-
-
-# ==========================================
-# ПРОВЕРКА СЕРВЕРА
-# ==========================================
-
-@app.route("/", methods=["GET"])
-def index():
-
-    return "Matnaya is alive!"
-
-
-@app.route("/health", methods=["GET"])
-def health():
-
-    return jsonify({
-        "status": "ok",
-        "service": "matnaya",
-        "model": MODEL
-    })
 
 
 # ==========================================
@@ -409,7 +361,7 @@ def chat():
 
 
 # ==========================================
-# ИНТЕГРАЦИЯ С АЛИСОЙ
+# АЛИСА
 # ==========================================
 
 @app.route("/alice", methods=["POST"])
@@ -421,11 +373,11 @@ def alice():
 
     session = data.get("session") or {}
 
-    # Правильное получение идентификатора пользователя Яндекса.
+    # Идентификатор пользователя
 
     user_id = (
-        session.get("user_id")
-        or (session.get("user") or {}).get("user_id")
+        (session.get("user") or {}).get("user_id")
+        or session.get("user_id")
         or session.get("session_id")
         or "alice"
     )
@@ -438,7 +390,7 @@ def alice():
         or ""
     ).strip()
 
-    # Запуск навыка.
+    # Запуск навыка
 
     if not text:
 
@@ -447,37 +399,141 @@ def alice():
             session
         )
 
-    # Проверка готовности предыдущего ответа.
+    state = get_user_state(user_id)
 
-    if is_status_question(text):
+    # ======================================
+    # ПРОВЕРЯЕМ ПРЕДЫДУЩИЙ ЗАПРОС
+    # ======================================
 
-        answer = collect_finished_answer(user_id)
+    with state_lock:
 
-        if answer is None:
+        answer, finished = finish_task_locked(user_id)
 
-            answer = (
-                "Я ещё думаю над предыдущим вопросом. "
-                "Спроси меня чуть позже."
+        if finished:
+
+            # Если пользователь проверяет готовность,
+            # отдаём готовый ответ.
+
+            if is_status_question(text):
+
+                return alice_response(answer, session)
+
+            # Если пришёл новый вопрос,
+            # сохраняем его в очередь.
+
+            if len(state["queue"]) < MAX_QUEUED_MESSAGES:
+
+                state["queue"].append(text[:2000])
+
+            return alice_response(answer, session)
+
+        # Если задача ещё работает.
+
+        if state["future"] is not None:
+
+            if is_status_question(text):
+
+                return alice_response(
+                    "Ещё немного, я заканчиваю предыдущий ответ.",
+                    session
+                )
+
+            if len(state["queue"]) < MAX_QUEUED_MESSAGES:
+
+                state["queue"].append(text[:2000])
+
+                return alice_response(
+                    "Секунду, я ещё разбираюсь с предыдущим вопросом.",
+                    session
+                )
+
+            return alice_response(
+                "У меня уже очередь вопросов. Давай немного подождём.",
+                session
             )
+
+        # Если очередь осталась, запускаем её.
+
+        if state["queue"]:
+
+            start_next_locked(user_id)
+
+            return alice_response(
+                "Секунду, я заканчиваю предыдущий вопрос.",
+                session
+            )
+
+        # Проверка статуса без активной задачи.
+
+        if is_status_question(text):
+
+            return alice_response(
+                "У меня сейчас нет ожидающего ответа. Что случилось?",
+                session
+            )
+
+        # Запускаем новую задачу.
+
+        future = executor.submit(
+            get_ai_reply,
+            user_id,
+            text
+        )
+
+        state["future"] = future
+
+    # ======================================
+    # ПЫТАЕМСЯ ПОЛУЧИТЬ ОТВЕТ СРАЗУ
+    # ======================================
+
+    try:
+
+        answer = future.result(
+            timeout=ALICE_WAIT_TIMEOUT
+        )
+
+        with state_lock:
+
+            # Проверяем, не забрал ли ответ
+            # параллельный запрос.
+
+            if state["future"] is future:
+
+                state["future"] = None
+
+                start_next_locked(user_id)
+
+        print("Alice received direct AI response")
 
         return alice_response(answer, session)
 
-    # Добавляем новое сообщение в очередь.
+    except TimeoutError:
 
-    accepted = enqueue_message(user_id, text)
-
-    if not accepted:
+        print(
+            f"Alice background processing: {user_id}"
+        )
 
         return alice_response(
-            "У меня уже очередь вопросов. "
-            "Давай сначала разберём предыдущие.",
+            "Секунду, я думаю над ответом.",
             session
         )
 
-    return alice_response(
-        "Вопрос получила. Сейчас разберусь.",
-        session
-    )
+    except Exception as exc:
+
+        print("Alice future error:", repr(exc))
+
+        with state_lock:
+
+            if state["future"] is future:
+
+                state["future"] = None
+
+                start_next_locked(user_id)
+
+        return alice_response(
+            "Что-то пошло не так при обработке вопроса.",
+            session
+        )
 
 
 # ==========================================
@@ -486,17 +542,13 @@ def alice():
 
 def alice_response(text, session):
 
-    response = {
-        "text": str(text)[:1024],
-        "end_session": False
-    }
-
     result = {
-        "response": response,
+        "response": {
+            "text": str(text)[:1024],
+            "end_session": False
+        },
         "version": "1.0"
     }
-
-    # Сохраняем состояние сессии, если оно есть.
 
     session_state = session.get("session_state")
 
@@ -505,6 +557,26 @@ def alice_response(text, session):
         result["session_state"] = session_state
 
     return jsonify(result)
+
+
+# ==========================================
+# ПРОВЕРКА СЕРВЕРА
+# ==========================================
+
+@app.route("/", methods=["GET"])
+def index():
+
+    return "Matnaya is alive!"
+
+
+@app.route("/health", methods=["GET"])
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "service": "matnaya",
+        "model": MODEL
+    })
 
 
 # ==========================================
