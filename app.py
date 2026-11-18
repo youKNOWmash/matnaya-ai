@@ -465,16 +465,6 @@ def alice():
     alice_request = data.get("request") or {}
     session = data.get("session") or {}
 
-    print("ALICE INPUT:", {
-        "command": alice_request.get("command"),
-        "original_utterance": alice_request.get("original_utterance"),
-        "session_id": session.get("session_id"),
-        "user_id": session.get("user_id"),
-        "user": session.get("user"),
-    })
-
-    # Стабильный идентификатор пользователя.
-
     user_id = (
         (session.get("user") or {}).get("user_id")
         or session.get("user_id")
@@ -490,99 +480,96 @@ def alice():
         or ""
     ).strip()
 
-    # ======================================
-    # ПРИВЕТСТВИЕ
-    # ======================================
+    print("ALICE INPUT:", {
+        "text": text,
+        "user_id": user_id
+    })
 
+    # Приветствие
     if not text:
-
         return alice_response(
             "О, привет! Я Матная. Ну что, о чём поболтаем?",
             session
         )
 
-    # ======================================
-    # ПОЛУЧЕНИЕ ГОТОВОГО ОТВЕТА
-    # ======================================
-
+    # Проверяем, не готов ли предыдущий ответ
     if is_status_question(text):
-
         answer = take_completed_answer(user_id)
 
         if answer is not None:
-
-            return alice_response(
-                answer,
-                session
-            )
+            return alice_response(answer, session)
 
         state = get_user_state(user_id)
 
         with lock:
-
             has_pending = any(
                 job["status"] in ("queued", "running")
                 for job in state["jobs"]
             )
 
         if has_pending:
-
             return alice_response(
                 "Ещё думаю над твоим вопросом. Подожди немного.",
                 session
             )
 
         return alice_response(
-            "У меня сейчас нет ожидающего ответа. Что случилось?",
+            "Пока готовых ответов нет. Чего хотел?",
             session
         )
 
-    # ======================================
-    # ДОБАВЛЯЕМ НОВЫЙ ВОПРОС
-    # ======================================
+    # СНАЧАЛА забираем старый готовый ответ
+    previous_answer = take_completed_answer(user_id)
 
+    if previous_answer is not None:
+
+        # Текущую реплику тоже сохраняем в очередь
+        new_job = enqueue_job(user_id, text)
+
+        if new_job is None:
+            return alice_response(
+                previous_answer + " А новый вопрос пока не влез в очередь. Повтори его.",
+                session
+            )
+
+        print("Delivering previous answer:", user_id)
+
+        return alice_response(
+            previous_answer,
+            session
+        )
+
+    # Проверяем, есть ли незавершённые задачи
     state = get_user_state(user_id)
 
     with lock:
-
         has_unanswered = any(
-            job["status"] != "delivered"
+            job["status"] in ("queued", "running")
             for job in state["jobs"]
         )
 
+    # Добавляем новый вопрос
     job = enqueue_job(user_id, text)
 
     if job is None:
-
         return alice_response(
-            "У меня уже накопилась очередь вопросов. "
-            "Давай сначала разберём предыдущие.",
+            "У меня уже очередь набилась. Дай сначала закончить предыдущие вопросы.",
             session
         )
 
-    # ======================================
-    # ЕСЛИ ЕСТЬ СТАРЫЕ НЕПОЛУЧЕННЫЕ ОТВЕТЫ
-    # ======================================
-
+    # Если уже обрабатывается другой вопрос
     if has_unanswered:
-
         return alice_response(
-            "Запомнила твой вопрос. Сначала закончу предыдущий.",
+            "Запомнила. Сначала закончу предыдущий вопрос.",
             session
         )
 
-    # ======================================
-    # ЖДЁМ НАСТОЯЩИЙ ОТВЕТ МОДЕЛИ
-    # ======================================
-
+    # Ждём ответ модели
     if job["event"].wait(timeout=ALICE_WAIT_TIMEOUT):
 
         with lock:
-
             if job["status"] == "done":
-
                 answer = job["result"]
-
                 job["status"] = "delivered"
 
                 try:
@@ -590,14 +577,7 @@ def alice():
                 except ValueError:
                     pass
 
-                return alice_response(
-                    answer,
-                    session
-                )
-
-    # ======================================
-    # ЕСЛИ МОДЕЛЬ НЕ УСПЕЛА
-    # ======================================
+                return alice_response(answer, session)
 
     return alice_response(
         "Секунду, я ещё думаю над твоим вопросом.",
