@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 APIMIRA_API_KEY = os.getenv("APIMIRA_API_KEY")
 API_URL = "https://apimira.com/v1/chat/completions"
-MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
+MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.6-terra")
 
 
 # ==========================================
