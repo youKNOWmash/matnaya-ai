@@ -590,10 +590,17 @@ def alice():
 # ==========================================
 
 def alice_response(text, session):
+    text = str(text)
+
+    # Ограничиваем ответ до 1000 байт UTF-8
+    encoded = text.encode("utf-8")[:1000]
+
+    # Убираем обрезанный символ, если он попал на границу
+    safe_text = encoded.decode("utf-8", errors="ignore")
 
     result = {
         "response": {
-            "text": str(text)[:1024],
+            "text": safe_text,
             "end_session": False
         },
         "version": "1.0"
@@ -602,7 +609,6 @@ def alice_response(text, session):
     session_state = session.get("session_state")
 
     if session_state is not None:
-
         result["session_state"] = session_state
 
     return jsonify(result)
