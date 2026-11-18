@@ -467,6 +467,13 @@ def alice():
     alice_request = data.get("request") or {}
 
     session = data.get("session") or {}
+    print("ALICE INPUT:", {
+    "command": alice_request.get("command"),
+    "original_utterance": alice_request.get("original_utterance"),
+    "session_id": session.get("session_id"),
+    "user_id": session.get("user_id"),
+    "user": session.get("user"),
+})
 
     # Стабильный идентификатор пользователя.
 
