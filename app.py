@@ -24,7 +24,7 @@ API_URL = os.getenv(
 
 MODEL = os.getenv(
     "OPENAI_MODEL",
-    "openai/gpt-5.6-terra"
+    "openai/gpt-5.4-mini"
 )
 
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "60"))
