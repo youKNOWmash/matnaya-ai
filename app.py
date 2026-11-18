@@ -1,8 +1,7 @@
 import os
-import time
 import threading
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
 
 import requests
 from flask import Flask, request, jsonify
@@ -17,22 +16,28 @@ app = Flask(__name__)
 # ==========================================
 
 APIMIRA_API_KEY = os.getenv("APIMIRA_API_KEY")
-API_URL = os.getenv("APIMIRA_API_URL", "https://apimira.com/v1/chat/completions")
+API_URL = os.getenv(
+    "APIMIRA_API_URL",
+    "https://apimira.com/v1/chat/completions"
+)
 MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.6-terra")
 
-# Алиса должна получить HTTP-ответ быстро. Долгий запрос к модели
-# выполняется в фоновом потоке, а результат забирается отдельной фразой.
-ALICE_REQUEST_TIMEOUT = float(os.getenv("ALICE_REQUEST_TIMEOUT", "60"))
-MAX_HISTORY = 20
-MAX_QUEUED_MESSAGES = 1
+API_TIMEOUT = float(os.getenv("API_TIMEOUT", "60"))
 
-# Один процесс приложения хранит задачи в памяти.
-# При перезапуске Render незавершённые фоновые задачи пропадут.
-executor = ThreadPoolExecutor(max_workers=4)
+MAX_HISTORY = 20
+MAX_QUEUED_MESSAGES = 5
+
+executor = ThreadPoolExecutor(max_workers=8)
+
 state_lock = threading.RLock()
+
 history = defaultdict(list)
-pending = {}       # user_id -> {"future": Future, "queued_text": str|None}
-completed = {}     # user_id -> готовый ответ, если задача завершилась
+
+# Состояние каждого пользователя:
+# future — выполняющийся запрос
+# queue — очередь сообщений
+
+users = {}
 
 
 # ==========================================
@@ -102,109 +107,257 @@ SYSTEM_PROMPT = """
 
 
 # ==========================================
-# ОБЩАЯ ФУНКЦИЯ ОБЩЕНИЯ С APIMIRA
+# ИСТОРИЯ ДИАЛОГА
 # ==========================================
 
-def get_ai_reply(user_id, text, timeout=ALICE_REQUEST_TIMEOUT):
-    """Синхронный запрос к ApiMira. Вызывается обычным чатом или фоновым потоком."""
-    if not APIMIRA_API_KEY:
-        return "У меня нет API-ключа ApiMira. Проверь переменную APIMIRA_API_KEY в Render."
+def add_to_history(user_id, role, content):
 
     with state_lock:
-        history[user_id].append({"role": "user", "content": text})
+
+        history[user_id].append({
+            "role": role,
+            "content": content
+        })
+
         history[user_id] = history[user_id][-MAX_HISTORY:]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history[user_id])
+
+
+# ==========================================
+# ЗАПРОС К APIMIRA
+# ==========================================
+
+def get_ai_reply(user_id, text):
+
+    if not APIMIRA_API_KEY:
+        return (
+            "У меня нет API-ключа ApiMira. "
+            "Проверь APIMIRA_API_KEY в Render."
+        )
+
+    add_to_history(user_id, "user", text)
+
+    with state_lock:
+
+        messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            }
+        ] + list(history[user_id])
 
     payload = {
         "model": MODEL,
         "messages": messages,
         "max_tokens": 500,
-        "temperature": 0.9,
+        "temperature": 0.9
     }
+
     headers = {
         "Authorization": f"Bearer {APIMIRA_API_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
     try:
+
         response = requests.post(
             API_URL,
             json=payload,
             headers=headers,
-            timeout=timeout,
+            timeout=(5, API_TIMEOUT)
         )
+
         response.raise_for_status()
 
         result = response.json()
+
         reply = result["choices"][0]["message"]["content"]
+
         if not isinstance(reply, str) or not reply.strip():
+
             reply = "Я получила пустой ответ. Какого хрена."
 
-        with state_lock:
-            history[user_id].append({"role": "assistant", "content": reply})
-            history[user_id] = history[user_id][-MAX_HISTORY:]
+        reply = reply.strip()
 
-        return reply.strip()
+        add_to_history(user_id, "assistant", reply)
+
+        return reply
 
     except requests.exceptions.Timeout:
-        return "Модель слишком долго отвечает. Попробуй проверить готовность ещё раз чуть позже."
+
+        print("ApiMira timeout")
+
+        reply = "Модель слишком долго отвечает. Попробуй ещё раз."
+
     except requests.exceptions.HTTPError:
-        # Подробности остаются в логах Render, ключ авторизации туда не выводим.
-        print("ApiMira HTTP error:", response.status_code, response.text[:1500])
-        return f"ApiMira вернула HTTP {response.status_code}. Проверь модель, API-ключ и доступный баланс."
+
+        print(
+            "ApiMira HTTP error:",
+            response.status_code,
+            response.text[:1500]
+        )
+
+        reply = (
+            f"ApiMira вернула HTTP {response.status_code}. "
+            "Проверь API-ключ, модель и баланс."
+        )
+
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        print("ApiMira response parsing error:", repr(exc))
-        return "Мне пришёл непонятный ответ от ApiMira."
+
+        print("ApiMira parsing error:", repr(exc))
+
+        reply = "Мне пришёл непонятный ответ от ApiMira."
+
     except requests.exceptions.RequestException as exc:
+
         print("ApiMira connection error:", repr(exc))
-        return "Не могу подключиться к ApiMira. Попробуй ещё раз."
+
+        reply = "Не могу подключиться к ApiMira."
+
     except Exception as exc:
+
         print("Unexpected AI error:", repr(exc))
-        return "Что-то пошло не так. Попробуй ещё раз."
+
+        reply = "Что-то пошло не так."
+
+    add_to_history(user_id, "assistant", reply)
+
+    return reply
 
 
 # ==========================================
-# ФОНОВАЯ ОБРАБОТКА ДЛЯ АЛИСЫ
+# СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
+# ==========================================
+
+def get_user_state(user_id):
+
+    with state_lock:
+
+        if user_id not in users:
+
+            users[user_id] = {
+                "future": None,
+                "queue": deque()
+            }
+
+        return users[user_id]
+
+
+# ==========================================
+# ЗАПУСК СЛЕДУЮЩЕГО ЗАПРОСА
+# ==========================================
+
+def start_next_locked(user_id):
+
+    state = users[user_id]
+
+    if state["future"] is not None:
+        return
+
+    if not state["queue"]:
+        return
+
+    text = state["queue"].popleft()
+
+    future = executor.submit(
+        get_ai_reply,
+        user_id,
+        text
+    )
+
+    state["future"] = future
+
+    print(
+        f"Background task started: "
+        f"user={user_id}, remaining={len(state['queue'])}"
+    )
+
+
+# ==========================================
+# ДОБАВЛЕНИЕ СООБЩЕНИЯ В ОЧЕРЕДЬ
+# ==========================================
+
+def enqueue_message(user_id, text):
+
+    with state_lock:
+
+        state = get_user_state(user_id)
+
+        if len(state["queue"]) >= MAX_QUEUED_MESSAGES:
+
+            return False
+
+        state["queue"].append(text[:2000])
+
+        start_next_locked(user_id)
+
+        return True
+
+
+# ==========================================
+# ПРОВЕРКА ГОТОВНОСТИ
 # ==========================================
 
 def is_status_question(text):
+
     normalized = (text or "").strip().lower()
+
     phrases = (
-        "ответ готов", "готов ответ", "ты закончила", "ну что там",
-        "проверить ответ", "есть ответ", "матная ответь", "получилось",
+        "ответ готов",
+        "готов ответ",
+        "ты закончила",
+        "ну что там",
+        "проверить ответ",
+        "есть ответ",
+        "матная ответь",
+        "получилось",
+        "ты уже ответила",
+        "готово",
     )
-    return any(phrase in normalized for phrase in phrases)
 
-
-def start_background_answer(user_id, text):
-    future = executor.submit(get_ai_reply, user_id, text, ALICE_REQUEST_TIMEOUT)
-    with state_lock:
-        pending[user_id] = {"future": future, "queued_text": None}
+    return any(
+        phrase in normalized
+        for phrase in phrases
+    )
 
 
 def collect_finished_answer(user_id):
-    """Переносит результат Future в completed, если он уже готов."""
-    with state_lock:
-        task = pending.get(user_id)
-        if not task:
-            return completed.pop(user_id, None)
 
-        future = task["future"]
+    with state_lock:
+
+        state = get_user_state(user_id)
+
+        future = state["future"]
+
+        if future is None:
+
+            if state["queue"]:
+
+                start_next_locked(user_id)
+
+                return None
+
+            return None
+
         if not future.done():
+
             return None
 
         try:
+
             answer = future.result()
+
         except Exception as exc:
+
             print("Background task error:", repr(exc))
-            answer = "У меня тут фоновая задачка споткнулась. Попробуй ещё раз."
 
-        queued_text = task.get("queued_text")
-        pending.pop(user_id, None)
+            answer = "У меня тут фоновая задачка споткнулась."
 
-        if queued_text:
-            # Запускаем отложенное сообщение после завершения предыдущего.
-            start_background_answer(user_id, queued_text)
+        state["future"] = None
+
+        # Запускаем следующее сообщение,
+        # если пользователь успел задать ещё вопросы.
+
+        start_next_locked(user_id)
 
         return answer
 
@@ -215,12 +368,18 @@ def collect_finished_answer(user_id):
 
 @app.route("/", methods=["GET"])
 def index():
+
     return "Matnaya is alive!"
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "matnaya", "model": MODEL})
+
+    return jsonify({
+        "status": "ok",
+        "service": "matnaya",
+        "model": MODEL
+    })
 
 
 # ==========================================
@@ -229,33 +388,48 @@ def health():
 
 @app.route("/chat", methods=["POST"])
 def chat():
+
     data = request.get_json(silent=True) or {}
+
     user_id = str(data.get("user_id", "default"))
+
     text = str(data.get("text", "")).strip()
 
     if not text:
-        return jsonify({"reply": "Ты мне пустоту прислал, гений."}), 400
 
-    return jsonify({"reply": get_ai_reply(user_id, text)})
+        return jsonify({
+            "reply": "Ты мне пустоту прислал, гений."
+        }), 400
+
+    reply = get_ai_reply(user_id, text)
+
+    return jsonify({
+        "reply": reply
+    })
 
 
 # ==========================================
-# ИНТЕГРАЦИЯ С ЯНДЕКС АЛИСОЙ
+# ИНТЕГРАЦИЯ С АЛИСОЙ
 # ==========================================
 
 @app.route("/alice", methods=["POST"])
 def alice():
+
     data = request.get_json(silent=True) or {}
+
     alice_request = data.get("request") or {}
+
     session = data.get("session") or {}
 
-    # Для одного пользователя навыка используем стабильный user_id.
+    # Правильное получение идентификатора пользователя Яндекса.
+
     user_id = (
-        (session.get("user") or {}).get("user_id")
-        or (session.get("application") or {}).get("application_id")
+        session.get("user_id")
+        or (session.get("user") or {}).get("user_id")
         or session.get("session_id")
         or "alice"
     )
+
     user_id = str(user_id)
 
     text = str(
@@ -264,63 +438,85 @@ def alice():
         or ""
     ).strip()
 
+    # Запуск навыка.
+
     if not text:
-        answer = (
-            "О, привет! Я Матная. Если мой ответ задержится, "
-            "скажи: «Матная, ответ готов?»"
+
+        return alice_response(
+            "О, привет! Я Матная. Ну что, о чём поболтаем?",
+            session
         )
-        return alice_response(answer, session)
 
-    # Пользователь проверяет, готов ли предыдущий ответ.
+    # Проверка готовности предыдущего ответа.
+
     if is_status_question(text):
+
         answer = collect_finished_answer(user_id)
+
         if answer is None:
-            answer = "Ещё думаю, не торопи лошадей. Спроси «Матная, ответ готов?» чуть позже."
-        elif answer == "":
-            answer = "У меня пока нет ожидающего ответа. Скажи, что хочешь узнать."
+
+            answer = (
+                "Я ещё думаю над предыдущим вопросом. "
+                "Спроси меня чуть позже."
+            )
+
         return alice_response(answer, session)
 
-    # Если предыдущая задача ещё выполняется — сохраняем одно следующее сообщение,
-    # чтобы не потерять его, и просим проверить готовность позже.
-    with state_lock:
-        task = pending.get(user_id)
-        if task:
-            if task.get("queued_text") is None:
-                task["queued_text"] = text[:2000]
-                answer = "Я ещё отвечаю на предыдущий вопрос и запомнила следующий. Спроси «Матная, ответ готов?» чуть позже."
-            else:
-                answer = "Я уже запомнила следующий вопрос. Сначала забери мой предыдущий ответ: скажи «Матная, ответ готов?»."
-            return alice_response(answer, session)
+    # Добавляем новое сообщение в очередь.
 
-    # Быстро подтверждаем запрос, а модель отвечает в фоне.
-    start_background_answer(user_id, text)
+    accepted = enqueue_message(user_id, text)
+
+    if not accepted:
+
+        return alice_response(
+            "У меня уже очередь вопросов. "
+            "Давай сначала разберём предыдущие.",
+            session
+        )
+
     return alice_response(
-        "Приняла вопрос. Я уже думаю над ответом. Скажи «Матная, ответ готов?» через несколько секунд.",
-        session,
+        "Вопрос получила. Сейчас разберусь.",
+        session
     )
 
 
+# ==========================================
+# ФОРМИРОВАНИЕ ОТВЕТА АЛИСЫ
+# ==========================================
+
 def alice_response(text, session):
+
     response = {
         "text": str(text)[:1024],
-        "end_session": False,
+        "end_session": False
     }
 
-    # Сохраняем session_state, если Яндекс передал его в исходном запросе.
-    session_state = session.get("session_state")
     result = {
         "response": response,
-        "version": "1.0",
+        "version": "1.0"
     }
+
+    # Сохраняем состояние сессии, если оно есть.
+
+    session_state = session.get("session_state")
+
     if session_state is not None:
+
         result["session_state"] = session_state
 
     return jsonify(result)
 
 
 # ==========================================
-# ЗАПУСК ЛОКАЛЬНО
+# ЗАПУСК
 # ==========================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
+    port = int(os.getenv("PORT", "5000"))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
